@@ -10,116 +10,118 @@
  *
  *	You must have an ANSI C compiler to build this program.
  */
- 
-#include <stdio.h>
-#include <string.h>
-#ifndef PYRAMID
-#include <stdlib.h>
-#endif
-#include <ctype.h>
-#include <curses.h>
-#include <stdarg.h>
-#include <signal.h>
-
-#include "scott.h"
-
-#ifdef AMIGA
-#define NOGETPID
-#define NOSTRNCASECMP
-#endif
-
-#ifdef PYRAMID
-#define NOSTRNCASECMP
-#endif
 
 /*
- *	Configuration Twiddles
+ * Parts of this source file (mainly the Glk parts) are copyright 2011
+ * Chris Spiegel.
+ *
+ * Some notes about the Glk version:
+ *
+ * o Room descriptions, exits, and visible items can, as in the
+ *   original, be placed in a window at the top of the screen, or can be
+ *   inline with user input in the main window.  The former is default,
+ *   and the latter can be selected with the -w flag.
+ *
+ * o Game saving and loading uses Glk, which means that providing a
+ *   save game file on the command-line will no longer work.  Instead,
+ *   the verb "restore" has been special-cased to call GameLoad(), which
+ *   now prompts for a filename via Glk.
+ *
+ * o The local character set is expected to be compatible with ASCII, at
+ *   least in the printable character range.  Newlines are specially
+ *   handled, however, and converted to Glk's expected newline
+ *   character.
  */
- 
-#ifdef NOSTRNCASECMP
 
-static int strncasecmp(char *a,char *b, int n)
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <time.h>
+
+#include "glk.h"
+#include "glkstart.h"
+
+#include "bsd.h"
+#include "scott.h"
+
+#ifdef __GNUC__
+__attribute__((__format__(__printf__, 2, 3)))
+#endif
+static void wprintf(winid_t w, const char *fmt, ...)
 {
-	while(*a&&n>0)
+	va_list ap;
+	char msg[2048];
+
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof msg, fmt, ap);
+	va_end(ap);
+
+	/* Map newline to a Glk-compatible newline. */
+	for(size_t i = 0; msg[i] != 0; i++)
 	{
-		char c=*a;
-		char d=*b;
-		if(islower(c))
-			c=toupper(c);
-		if(islower(d))
-			d=toupper(d);
-		if(c<d)
-			return(-1);
-		if(c>d)
-			return(1);
-		a++;
-		b++;
-		n--;
-		if(n==0)
-			return(0);
+		if(msg[i] == '\n') msg[i] = 10;
 	}
-	if(*b)
-		return(1);
-	return(0);
+
+	glk_put_string_stream(glk_window_get_stream(w), msg);
 }
-#endif
 
-#ifdef NOGETPID
-#ifndef AMIGA
-#define getpid()   6031769
-#else
-#define getpid()   ((int)FindTask(NULL))
-#endif
-#endif
+static void delay(int seconds)
+{
+	event_t ev;
 
-Header GameHeader;
-Tail GameTail;
-Item *Items;
-Room *Rooms;
-char **Verbs;
-char **Nouns;
-char **Messages;
-Action *Actions;
-int LightRefill;
-char NounText[16];
-int Counters[16];	/* Range unknown */
-int CurrentCounter;
-int SavedRoom;
-int RoomSaved[16];	/* Range unknown */
-int DisplayUp;		/* Curses up */
-WINDOW *Top,*Bottom;
-int Redraw;		/* Update item window */
-int Options;		/* Option flags set */
-int Width;		/* Terminal width */
-int TopHeight;		/* Height of top window */
-int BottomHeight;	/* Height of bottom window */
+	if(!glk_gestalt(gestalt_Timer, 0))
+		return;
+
+	glk_request_timer_events(1000 * seconds);
+
+	do
+	{
+		glk_select(&ev);
+	} while(ev.type != evtype_Timer);
+
+	glk_request_timer_events(0);
+}
+
+static Header GameHeader;
+static Item *Items;
+static Room *Rooms;
+static const char **Verbs;
+static const char **Nouns;
+static const char **Messages;
+static Action *Actions;
+static int LightRefill;
+static char NounText[16];
+static int Counters[16];	/* Range unknown */
+static int CurrentCounter;
+static int SavedRoom;
+static int RoomSaved[16];	/* Range unknown */
+static int Options;		/* Option flags set */
+static int Width;		/* Terminal width */
+static int TopHeight;		/* Height of top window */
+
+static int split_screen = 1;
+static winid_t Bottom, Top;
 
 #define TRS80_LINE	"\n<------------------------------------------------------------>\n"
 
 #define MyLoc	(GameHeader.PlayerRoom)
 
-long BitFlags=0;	/* Might be >32 flags - I haven't seen >32 yet */
+static long BitFlags=0;	/* Might be >32 flags - I haven't seen >32 yet */
 
-void Fatal(char *x)
+static void Fatal(const char *x)
 {
-	if(DisplayUp)
-		endwin();
-	fprintf(stderr,"%s.\n",x);
-	exit(1);
+	wprintf(Bottom, "%s\n", x);
+	glk_exit();
 }
 
-void Aborted()
+static void ClearScreen(void)
 {
-	Fatal("User exit");
+	glk_window_clear(Bottom);
 }
 
-void ClearScreen(void)
-{
-	werase(Bottom);
-	wrefresh(Bottom);
-}
-
-void *MemAlloc(int size)
+static void *MemAlloc(int size)
 {
 	void *t=(void *)malloc(size);
 	if(t==NULL)
@@ -127,7 +129,7 @@ void *MemAlloc(int size)
 	return(t);
 }
 
-int RandomPercent(int n)
+static int RandomPercent(int n)
 {
 	unsigned int rv=rand()<<6;
 	rv%=100;
@@ -136,7 +138,7 @@ int RandomPercent(int n)
 	return(0);
 }
 
-int CountCarried()
+static int CountCarried(void)
 {
 	int ct=0;
 	int n=0;
@@ -149,10 +151,10 @@ int CountCarried()
 	return(n);
 }
 
-char *MapSynonym(char *word)
+static const char *MapSynonym(const char *word)
 {
 	int n=1;
-	char *tp;
+	const char *tp;
 	static char lastword[16];	/* Last non synonym */
 	while(n<=GameHeader.NumWords)
 	{
@@ -161,38 +163,38 @@ char *MapSynonym(char *word)
 			tp++;
 		else
 			strcpy(lastword,tp);
-		if(strncasecmp(word,tp,GameHeader.WordLength)==0)
+		if(xstrncasecmp(word,tp,GameHeader.WordLength)==0)
 			return(lastword);
 		n++;
 	}
 	return(NULL);
 }
 
-int MatchUpItem(char *text, int loc)
+static int MatchUpItem(const char *text, int loc)
 {
-	char *word=MapSynonym(text);
+	const char *word=MapSynonym(text);
 	int ct=0;
-	
+
 	if(word==NULL)
 		word=text;
-	
+
 	while(ct<=GameHeader.NumItems)
 	{
 		if(Items[ct].AutoGet && Items[ct].Location==loc &&
-			strncasecmp(Items[ct].AutoGet,word,GameHeader.WordLength)==0)
+			xstrncasecmp(Items[ct].AutoGet,word,GameHeader.WordLength)==0)
 			return(ct);
 		ct++;
 	}
 	return(-1);
 }
 
-char *ReadString(FILE *f)
+static char *ReadString(FILE *f)
 {
 	char tmp[1024];
 	char *t;
 	int c,nc;
 	int ct=0;
-oops:	do
+	do
 	{
 		c=fgetc(f);
 	}
@@ -215,9 +217,25 @@ oops:	do
 				break;
 			}
 		}
-		if(c==0x60) 
+		if(c=='`')
 			c='"'; /* pdd */
-		tmp[ct++]=c;
+
+		/* Ensure a valid Glk newline is sent. */
+		if(c=='\n')
+			tmp[ct++]=10;
+		/* Special case: assume CR is part of CRLF in a
+		 * DOS-formatted file, and ignore it.
+		 */
+		else if(c==13)
+			;
+		/* Pass only ASCII to Glk; the other reasonable option
+		 * would be to pass Latin-1, but it's probably safe to
+		 * assume that Scott Adams games are ASCII only.
+		 */
+		else if((c >= 32 && c <= 126))
+			tmp[ct++]=c;
+		else
+			tmp[ct++]='?';
 	}
 	while(1);
 	tmp[ct]=0;
@@ -225,8 +243,8 @@ oops:	do
 	memcpy(t,tmp,ct+1);
 	return(t);
 }
-	
-void LoadDatabase(FILE *f, int loud)
+
+static void LoadDatabase(FILE *f, int loud)
 {
 	int ni,na,nw,nr,mc,pr,tr,wl,lt,mn,trm;
 	int ct;
@@ -235,9 +253,9 @@ void LoadDatabase(FILE *f, int loud)
 	Room *rp;
 	Item *ip;
 /* Load the header */
-	
+
 	if(fscanf(f,"%*d %d %d %d %d %d %d %d %d %d %d %d",
-		&ni,&na,&nw,&nr,&mc,&pr,&tr,&wl,&lt,&mn,&trm,&ct)<10)
+		&ni,&na,&nw,&nr,&mc,&pr,&tr,&wl,&lt,&mn,&trm)<10)
 		Fatal("Invalid database(bad header)");
 	GameHeader.NumItems=ni;
 	Items=(Item *)MemAlloc(sizeof(Item)*(ni+1));
@@ -245,8 +263,8 @@ void LoadDatabase(FILE *f, int loud)
 	Actions=(Action *)MemAlloc(sizeof(Action)*(na+1));
 	GameHeader.NumWords=nw;
 	GameHeader.WordLength=wl;
-	Verbs=(char **)MemAlloc(sizeof(char *)*(nw+1));
-	Nouns=(char **)MemAlloc(sizeof(char *)*(nw+1));
+	Verbs=MemAlloc(sizeof(char *)*(nw+1));
+	Nouns=MemAlloc(sizeof(char *)*(nw+1));
 	GameHeader.NumRooms=nr;
 	Rooms=(Room *)MemAlloc(sizeof(Room)*(nr+1));
 	GameHeader.MaxCarry=mc;
@@ -255,9 +273,9 @@ void LoadDatabase(FILE *f, int loud)
 	GameHeader.LightTime=lt;
 	LightRefill=lt;
 	GameHeader.NumMessages=mn;
-	Messages=(char **)MemAlloc(sizeof(char *)*(mn+1));
+	Messages=MemAlloc(sizeof(char *)*(mn+1));
 	GameHeader.TreasureRoom=trm;
-	
+
 /* Load the actions */
 
 	ct=0;
@@ -266,7 +284,7 @@ void LoadDatabase(FILE *f, int loud)
 		printf("Reading %d actions.\n",na);
 	while(ct<na+1)
 	{
-		if(fscanf(f,"%hd %hd %hd %hd %hd %hd %hd %hd",
+		if(fscanf(f,"%hu %hu %hu %hu %hu %hu %hu %hu",
 			&ap->Vocab,
 			&ap->Condition[0],
 			&ap->Condition[1],
@@ -281,7 +299,7 @@ void LoadDatabase(FILE *f, int loud)
 		}
 		ap++;
 		ct++;
-	}			
+	}
 	ct=0;
 	if(loud)
 		printf("Reading %d word pairs.\n",nw);
@@ -351,89 +369,17 @@ void LoadDatabase(FILE *f, int loud)
 		printf("%d.\nLoad Complete.\n\n",ct);
 }
 
-int OutputPos=0;
-
-void OutReset()
+static void Output(const char *a)
 {
-	OutputPos=0;
-	wmove(Bottom,BottomHeight-1,0);
-	wclrtoeol(Bottom);
+	wprintf(Bottom, "%s", a);
 }
 
-void OutBuf(char *buffer)
+static void OutputNumber(int a)
 {
-	char word[80];
-	int wp;
-	while(*buffer)
-	{
-		if(OutputPos==0)
-		{
-			while(*buffer && isspace(*buffer))
-			{
-				if(*buffer=='\n')
-				{
-					scroll(Bottom);
-					wmove(Bottom,BottomHeight-1,0);
-					wclrtoeol(Bottom);
-					OutputPos=0;
-				}
-				buffer++;
-			}
-		}
-		if(*buffer==0)
-			return;
-		wp=0;
-		while(*buffer && !isspace(*buffer))
-		{
-			word[wp++]=*buffer++;
-		}
-		word[wp]=0;
-/*		fprintf(stderr,"Word '%s' at %d\n",word,OutputPos);*/
-		if(OutputPos+strlen(word)>(Width-2))
-		{
-			scroll(Bottom);
-			wmove(Bottom,BottomHeight-1,0);
-			wclrtoeol(Bottom);
-			OutputPos=0;
-		}
-		wprintw(Bottom,word);
-		OutputPos+=strlen(word);
-		
-		if(*buffer==0)
-			return;
-		
-		if(*buffer=='\n')
-		{
-			scroll(Bottom);
-			wmove(Bottom,BottomHeight-1,0);
-			wclrtoeol(Bottom);
-			OutputPos=0;
-		}
-		else
-		{
-			OutputPos++;
-			if(OutputPos<(Width-1))
-				wprintw(Bottom," ");
-		}
-		buffer++;
-	}
+	wprintf(Bottom, "%d", a);
 }
 
-void Output(char *a)
-{
-	char block[512];
-	strcpy(block,a);
-	OutBuf(block);
-}
-
-void OutputNumber(int a)
-{
-	char buf[16];
-	sprintf(buf,"%d ",a);
-	OutBuf(buf);
-}
-		
-void Look()
+static void Look(void)
 {
 	static char *ExitNames[6]=
 	{
@@ -442,34 +388,34 @@ void Look()
 	Room *r;
 	int ct,f;
 	int pos;
-	
-	werase(Top);
-	wmove(Top,0,0);	/* Needed by some curses variants */
+
+	if(split_screen)
+		glk_window_clear(Top);
+
 	if((BitFlags&(1<<DARKBIT)) && Items[LIGHT_SOURCE].Location!= CARRIED
 	            && Items[LIGHT_SOURCE].Location!= MyLoc)
 	{
 		if(Options&YOUARE)
-			wprintw(Top,"You can't see. It is too dark!\n");
+			wprintf(Top,"You can't see. It is too dark!\n");
 		else
-			wprintw(Top,"I can't see. It is too dark!\n");
+			wprintf(Top,"I can't see. It is too dark!\n");
 		if (Options & TRS80_STYLE)
-			wprintw(Top,TRS80_LINE);
-		wrefresh(Top);
+			wprintf(Top,TRS80_LINE);
 		return;
 	}
 	r=&Rooms[MyLoc];
 	if(*r->Text=='*')
-		wprintw(Top,"%s\n",r->Text+1);
+		wprintf(Top,"%s\n",r->Text+1);
 	else
 	{
 		if(Options&YOUARE)
-			wprintw(Top,"You are %s\n",r->Text);
+			wprintf(Top,"You are in a %s\n",r->Text);
 		else
-			wprintw(Top,"I'm in a %s\n",r->Text);
+			wprintf(Top,"I'm in a %s\n",r->Text);
 	}
 	ct=0;
 	f=0;
-	wprintw(Top,"\nObvious exits: ");
+	wprintf(Top,"\nObvious exits: ");
 	while(ct<6)
 	{
 		if(r->Exits[ct]!=0)
@@ -477,14 +423,14 @@ void Look()
 			if(f==0)
 				f=1;
 			else
-				wprintw(Top,", ");
-			wprintw(Top,"%s",ExitNames[ct]);
+				wprintf(Top,", ");
+			wprintf(Top,"%s",ExitNames[ct]);
 		}
 		ct++;
 	}
 	if(f==0)
-		wprintw(Top,"none");
-	wprintw(Top,".\n");
+		wprintf(Top,"none");
+	wprintf(Top,".\n");
 	ct=0;
 	f=0;
 	pos=0;
@@ -495,43 +441,47 @@ void Look()
 			if(f==0)
 			{
 				if(Options&YOUARE)
-					wprintw(Top,"\nYou can also see: ");
+				{
+					wprintf(Top,"\nYou can also see: ");
+					pos=18;
+				}
 				else
-					wprintw(Top,"\nI can also see: ");
-				pos=16;
+				{
+					wprintf(Top,"\nI can also see: ");
+					pos=16;
+				}
 				f++;
 			}
 			else if (!(Options & TRS80_STYLE))
 			{
-				wprintw(Top," - ");
+				wprintf(Top," - ");
 				pos+=3;
 			}
 			if(pos+strlen(Items[ct].Text)>(Width-10))
 			{
 				pos=0;
-				wprintw(Top,"\n");
+				wprintf(Top,"\n");
 			}
-			wprintw(Top,"%s",Items[ct].Text);
+			wprintf(Top,"%s",Items[ct].Text);
 			pos += strlen(Items[ct].Text);
 			if (Options & TRS80_STYLE)
 			{
-				wprintw(Top,". ");
+				wprintf(Top,". ");
 				pos+=2;
 			}
 		}
 		ct++;
 	}
-	wprintw(Top,"\n");
+	wprintf(Top,"\n");
 	if (Options & TRS80_STYLE)
-		wprintw(Top,TRS80_LINE);
-	wrefresh(Top);
+		wprintf(Top,TRS80_LINE);
 }
 
-int WhichWord(char *word, char **list)
+static int WhichWord(const char *word, const char **list)
 {
 	int n=1;
 	int ne=1;
-	char *tp;
+	const char *tp;
 	while(ne<=GameHeader.NumWords)
 	{
 		tp=list[ne];
@@ -539,84 +489,126 @@ int WhichWord(char *word, char **list)
 			tp++;
 		else
 			n=ne;
-		if(strncasecmp(word,tp,GameHeader.WordLength)==0)
+		if(xstrncasecmp(word,tp,GameHeader.WordLength)==0)
 			return(n);
 		ne++;
 	}
 	return(-1);
 }
 
-
-
-void LineInput(char *buf)
+static void LineInput(char *buf, size_t n)
 {
-	int pos=0;
-	int ch;
+	event_t ev;
+
+	glk_request_line_event(Bottom, buf, n - 1, 0);
+
 	while(1)
 	{
-		wrefresh(Bottom);
-		ch=wgetch(Bottom);
-		switch(ch)
-		{
-			case 10:;
-			case 13:;
-				buf[pos]=0;
-				scroll(Bottom);
-				wmove(Bottom,BottomHeight,0);
-				return;
-			case 8:;
-			case 127:;
-				if(pos>0)
-				{
-					int y,x;
-					getyx(Bottom,y,x);
-					x--;
-					if(x==-1)
-					{
-						x=Width-1;
-						y--;
-					}
-					mvwaddch(Bottom,y,x,' ');
-					wmove(Bottom,y,x);
-					wrefresh(Bottom);
-					pos--;
-				}
-				break;
-			default:
-				if(ch>=' '&&ch<=126)
-				{
-					buf[pos++]=ch;
-					waddch(Bottom,(char)ch);
-					wrefresh(Bottom);
-				}
-				break;
-		}
+		glk_select(&ev);
+
+		if(ev.type == evtype_LineInput)
+			break;
+		else if(ev.type == evtype_Arrange && split_screen)
+			Look();
+	}
+
+	buf[ev.val1] = 0;
+}
+
+static void SaveGame(void)
+{
+	strid_t file;
+	frefid_t ref;
+	int ct;
+	char buf[128];
+
+	ref = glk_fileref_create_by_prompt(fileusage_TextMode | fileusage_SavedGame, filemode_Write, 0);
+	if(ref == NULL) return;
+
+	file = glk_stream_open_file(ref, filemode_Write, 0);
+	glk_fileref_destroy(ref);
+	if(file == NULL) return;
+
+	for(ct=0;ct<16;ct++)
+	{
+		snprintf(buf, sizeof buf, "%d %d\n",Counters[ct],RoomSaved[ct]);
+		glk_put_string_stream(file, buf);
+	}
+	snprintf(buf, sizeof buf, "%ld %d %hd %d %d %hd\n",BitFlags, (BitFlags&(1<<DARKBIT))?1:0,
+		MyLoc,CurrentCounter,SavedRoom,GameHeader.LightTime);
+	glk_put_string_stream(file, buf);
+	for(ct=0;ct<=GameHeader.NumItems;ct++)
+	{
+		snprintf(buf, sizeof buf, "%hd\n",(short)Items[ct].Location);
+		glk_put_string_stream(file, buf);
+	}
+
+	glk_stream_close(file, NULL);
+	Output("Saved.\n");
+}
+
+static void LoadGame(void)
+{
+	strid_t file;
+	frefid_t ref;
+	char buf[128];
+	int ct=0;
+	short lo;
+	short DarkFlag;
+
+	ref = glk_fileref_create_by_prompt(fileusage_TextMode | fileusage_SavedGame, filemode_Read, 0);
+	if(ref == NULL) return;
+
+	file = glk_stream_open_file(ref, filemode_Read, 0);
+	glk_fileref_destroy(ref);
+	if(file == NULL) return;
+
+	for(ct=0;ct<16;ct++)
+	{
+		glk_get_line_stream(file, buf, sizeof buf);
+		sscanf(buf, "%d %d",&Counters[ct],&RoomSaved[ct]);
+	}
+	glk_get_line_stream(file, buf, sizeof buf);
+	sscanf(buf, "%ld %hd %hd %d %d %hd\n",
+		&BitFlags,&DarkFlag,&MyLoc,&CurrentCounter,&SavedRoom,
+		&GameHeader.LightTime);
+	/* Backward compatibility */
+	if(DarkFlag)
+		BitFlags|=(1<<15);
+	for(ct=0;ct<=GameHeader.NumItems;ct++)
+	{
+		glk_get_line_stream(file, buf, sizeof buf);
+		sscanf(buf, "%hd\n",&lo);
+		Items[ct].Location=(unsigned char)lo;
 	}
 }
 
-void GetInput(vb,no)
-int *vb,*no;
+static int GetInput(int *vb, int *no)
 {
 	char buf[256];
 	char verb[10],noun[10];
 	int vc,nc;
 	int num;
+
 	do
 	{
 		do
 		{
 			Output("\nTell me what to do ? ");
-			wrefresh(Bottom);
-			LineInput(buf);
-			OutReset();
+			LineInput(buf, sizeof buf);
 			num=sscanf(buf,"%9s %9s",verb,noun);
 		}
 		while(num==0||*buf=='\n');
+		if(xstrcasecmp(verb, "restore") == 0)
+		{
+			LoadGame();
+			return -1;
+		}
 		if(num==1)
 			*noun=0;
 		if(*noun==0 && strlen(verb)==1)
 		{
-			switch(isupper(*verb)?tolower(*verb):*verb)
+			switch(isupper((unsigned char)*verb)?tolower((unsigned char)*verb):*verb)
 			{
 				case 'n':strcpy(verb,"NORTH");break;
 				case 'e':strcpy(verb,"EAST");break;
@@ -648,64 +640,11 @@ int *vb,*no;
 	}
 	while(vc==-1);
 	strcpy(NounText,noun);	/* Needed by GET/DROP hack */
+
+	return 0;
 }
 
-void SaveGame()
-{
-	char buf[256];
-	int ct;
-	FILE *f;
-	Output("Filename: ");
-	LineInput(buf);
-	Output("\n");
-	f=fopen(buf,"w");
-	if(f==NULL)
-	{
-		Output("Unable to create save file.\n");
-		return;
-	}
-	for(ct=0;ct<16;ct++)
-	{
-		fprintf(f,"%d %d\n",Counters[ct],RoomSaved[ct]);
-	}
-	fprintf(f,"%ld %d %hd %d %d %hd\n",BitFlags, (BitFlags&(1<<DARKBIT))?1:0,
-		MyLoc,CurrentCounter,SavedRoom,GameHeader.LightTime);
-	for(ct=0;ct<=GameHeader.NumItems;ct++)
-		fprintf(f,"%hd\n",(short)Items[ct].Location);
-	fclose(f);
-	Output("Saved.\n");
-}
-
-void LoadGame(char *name)
-{
-	FILE *f=fopen(name,"r");
-	int ct=0;
-	short lo;
-	short DarkFlag;
-	if(f==NULL)
-	{
-		Output("Unable to restore game.");
-		return;
-	}
-	for(ct=0;ct<16;ct++)
-	{
-		fscanf(f,"%d %d\n",&Counters[ct],&RoomSaved[ct]);
-	}
-	fscanf(f,"%ld %d %hd %d %d %hd\n",
-		&BitFlags,&DarkFlag,&MyLoc,&CurrentCounter,&SavedRoom,
-		&GameHeader.LightTime);
-	/* Backward compatibility */
-	if(DarkFlag)
-		BitFlags|=(1<<15);
-	for(ct=0;ct<=GameHeader.NumItems;ct++)
-	{
-		fscanf(f,"%hd\n",&lo);
-		Items[ct].Location=(unsigned char)lo;
-	}
-	fclose(f);
-}
-
-int PerformLine(int ct)
+static int PerformLine(int ct)
 {
 	int continuation=0;
 	int param[5],pptr=0;
@@ -836,21 +775,15 @@ int PerformLine(int ct)
 						Output("I've too much to carry! ");
 					break;
 				}
-				if(Items[param[pptr]].Location==MyLoc)
-					Redraw=1;
 				Items[param[pptr++]].Location= CARRIED;
 				break;
 			case 53:
-				Redraw=1;
 				Items[param[pptr++]].Location=MyLoc;
 				break;
 			case 54:
-				Redraw=1;
 				MyLoc=param[pptr++];
 				break;
 			case 55:
-				if(Items[param[pptr]].Location==MyLoc)
-					Redraw=1;
 				Items[param[pptr++]].Location=0;
 				break;
 			case 56:
@@ -863,8 +796,6 @@ int PerformLine(int ct)
 				BitFlags|=(1<<param[pptr++]);
 				break;
 			case 59:
-				if(Items[param[pptr]].Location==MyLoc)
-					Redraw=1;
 				Items[param[pptr++]].Location=0;
 				break;
 			case 60:
@@ -877,35 +808,29 @@ int PerformLine(int ct)
 					Output("I am dead.\n");
 				BitFlags&=~(1<<DARKBIT);
 				MyLoc=GameHeader.NumRooms;/* It seems to be what the code says! */
-				Look();
 				break;
 			case 62:
 			{
 				/* Bug fix for some systems - before it could get parameters wrong */
 				int i=param[pptr++];
 				Items[i].Location=param[pptr++];
-				Redraw=1;
 				break;
 			}
 			case 63:
 doneit:				Output("The game is now over.\n");
-				wrefresh(Bottom);
-				sleep(5);
-				endwin();
-				exit(0);
+				glk_exit();
 			case 64:
-				Look();
 				break;
 			case 65:
 			{
-				int ct=0;
+				int i=0;
 				int n=0;
-				while(ct<=GameHeader.NumItems)
+				while(i<=GameHeader.NumItems)
 				{
-					if(Items[ct].Location==GameHeader.TreasureRoom &&
-					  *Items[ct].Text=='*')
+					if(Items[i].Location==GameHeader.TreasureRoom &&
+					  *Items[i].Text=='*')
 					  	n++;
-					ct++;
+					i++;
 				}
 				if(Options&YOUARE)
 					Output("You have stored ");
@@ -924,15 +849,15 @@ doneit:				Output("The game is now over.\n");
 			}
 			case 66:
 			{
-				int ct=0;
+				int i=0;
 				int f=0;
 				if(Options&YOUARE)
 					Output("You are carrying:\n");
 				else
 					Output("I'm carrying:\n");
-				while(ct<=GameHeader.NumItems)
+				while(i<=GameHeader.NumItems)
 				{
-					if(Items[ct].Location==CARRIED)
+					if(Items[i].Location==CARRIED)
 					{
 						if(f==1)
 						{
@@ -942,9 +867,9 @@ doneit:				Output("The game is now over.\n");
 								Output(" - ");
 						}
 						f=1;
-						Output(Items[ct].Text);
+						Output(Items[i].Text);
 					}
-					ct++;
+					i++;
 				}
 				if(f==0)
 					Output("Nothing");
@@ -959,14 +884,11 @@ doneit:				Output("The game is now over.\n");
 				break;
 			case 69:
 				GameHeader.LightTime=LightRefill;
-				if(Items[LIGHT_SOURCE].Location==MyLoc)
-					Redraw=1;
 				Items[LIGHT_SOURCE].Location=CARRIED;
 				BitFlags&=~(1<<LIGHTOUTBIT);
 				break;
 			case 70:
 				ClearScreen(); /* pdd. */
-				OutReset();
 				break;
 			case 71:
 				SaveGame();
@@ -976,8 +898,6 @@ doneit:				Output("The game is now over.\n");
 				int i1=param[pptr++];
 				int i2=param[pptr++];
 				int t=Items[i1].Location;
-				if(t==MyLoc || Items[i2].Location==MyLoc)
-					Redraw=1;
 				Items[i1].Location=Items[i2].Location;
 				Items[i2].Location=t;
 				break;
@@ -986,8 +906,6 @@ doneit:				Output("The game is now over.\n");
 				continuation=1;
 				break;
 			case 74:
-				if(Items[param[pptr]].Location==MyLoc)
-					Redraw=1;
 				Items[param[pptr++]].Location= CARRIED;
 				break;
 			case 75:
@@ -995,15 +913,10 @@ doneit:				Output("The game is now over.\n");
 				int i1,i2;
 				i1=param[pptr++];
 				i2=param[pptr++];
-				if(Items[i1].Location==MyLoc)
-					Redraw=1;
 				Items[i1].Location=Items[i2].Location;
-				if(Items[i2].Location==MyLoc)
-					Redraw=1;
 				break;
 			}
 			case 76:	/* Looking at adventure .. */
-				Look();
 				break;
 			case 77:
 				if(CurrentCounter>=0)
@@ -1020,7 +933,6 @@ doneit:				Output("The game is now over.\n");
 				int t=MyLoc;
 				MyLoc=SavedRoom;
 				SavedRoom=t;
-				Redraw=1;
 				break;
 			}
 			case 81:
@@ -1063,13 +975,10 @@ doneit:				Output("The game is now over.\n");
 				int sr=MyLoc;
 				MyLoc=RoomSaved[p];
 				RoomSaved[p]=sr;
-				Redraw=1;
 				break;
 			}
 			case 88:
-				wrefresh(Top);
-				wrefresh(Bottom);
-				sleep(2);	/* DOC's say 2 seconds. Spectrum times at 1.5 */
+				delay(2);
 				break;
 			case 89:
 				pptr++;
@@ -1084,15 +993,15 @@ doneit:				Output("The game is now over.\n");
 		}
 		cc++;
 	}
-	return(1+continuation);		
+	return(1+continuation);
 }
 
 
-int PerformActions(int vb,int no)
+static int PerformActions(int vb,int no)
 {
 	static int disable_sysfunc=0;	/* Recursion lock */
 	int d=BitFlags&(1<<DARKBIT);
-	
+
 	int ct=0;
 	int fl;
 	int doagain=0;
@@ -1113,7 +1022,6 @@ int PerformActions(int vb,int no)
 		if(nl!=0)
 		{
 			MyLoc=nl;
-			Look();
 			return(0);
 		}
 		if(d)
@@ -1122,10 +1030,7 @@ int PerformActions(int vb,int no)
 				Output("You fell down and broke your neck. ");
 			else
 				Output("I fell down and broke my neck. ");
-			wrefresh(Bottom);
-			sleep(5);
-			endwin();
-			exit(0);
+			glk_exit();
 		}
 		if(Options&YOUARE)
 			Output("You can't go in that direction. ");
@@ -1162,17 +1067,25 @@ int PerformActions(int vb,int no)
 					if(f2==2)
 						doagain=1;
 					if(vb!=0 && doagain==0)
-						return;
+						return(0);
 				}
 			}
 		}
 		ct++;
-		if(Actions[ct].Vocab!=0)
+
+		/* Previously this did not check ct against
+		 * GameHeader.NumActions and would read past the end of
+		 * Actions.  I don't know what should happen on the last
+		 * action, but doing nothing is better than reading one
+		 * past the end.
+		 * --Chris
+		 */
+		if(ct <= GameHeader.NumActions && Actions[ct].Vocab!=0)
 			doagain=0;
 	}
 	if(fl!=0 && disable_sysfunc==0)
 	{
-		int i;
+		int item;
 		if(Items[LIGHT_SOURCE].Location==MyLoc ||
 		   Items[LIGHT_SOURCE].Location==CARRIED)
 		   	d=0;
@@ -1181,21 +1094,21 @@ int PerformActions(int vb,int no)
 			/* Yes they really _are_ hardcoded values */
 			if(vb==10)
 			{
-				if(strcasecmp(NounText,"ALL")==0)
+				if(xstrcasecmp(NounText,"ALL")==0)
 				{
-					int ct=0;
+					int i=0;
 					int f=0;
-					
+
 					if(d)
 					{
 						Output("It is dark.\n");
 						return 0;
 					}
-					while(ct<=GameHeader.NumItems)
+					while(i<=GameHeader.NumItems)
 					{
-						if(Items[ct].Location==MyLoc && Items[ct].AutoGet!=NULL && Items[ct].AutoGet[0]!='*')
+						if(Items[i].Location==MyLoc && Items[i].AutoGet!=NULL && Items[i].AutoGet[0]!='*')
 						{
-							no=WhichWord(Items[ct].AutoGet,Nouns);
+							no=WhichWord(Items[i].AutoGet,Nouns);
 							disable_sysfunc=1;	/* Don't recurse into auto get ! */
 							PerformActions(vb,no);	/* Recursively check each items table code */
 							disable_sysfunc=0;
@@ -1207,13 +1120,12 @@ int PerformActions(int vb,int no)
 									Output("I've too much to carry. ");
 								return(0);
 							}
-						 	Items[ct].Location= CARRIED;
-						 	Redraw=1;
-						 	OutBuf(Items[ct].Text);
-						 	Output(": O.K.\n");
-						 	f=1;
-						 }
-						 ct++;
+							Items[i].Location= CARRIED;
+							Output(Items[i].Text);
+							Output(": O.K.\n");
+							f=1;
+						}
+						i++;
 					}
 					if(f==0)
 						Output("Nothing taken.");
@@ -1232,8 +1144,8 @@ int PerformActions(int vb,int no)
 						Output("I've too much to carry. ");
 					return(0);
 				}
-				i=MatchUpItem(NounText,MyLoc);
-				if(i==-1)
+				item=MatchUpItem(NounText,MyLoc);
+				if(item==-1)
 				{
 					if(Options&YOUARE)
 						Output("It is beyond your power to do that. ");
@@ -1241,32 +1153,30 @@ int PerformActions(int vb,int no)
 						Output("It's beyond my power to do that. ");
 					return(0);
 				}
-				Items[i].Location= CARRIED;
+				Items[item].Location= CARRIED;
 				Output("O.K. ");
-				Redraw=1;
 				return(0);
 			}
 			if(vb==18)
 			{
-				if(strcasecmp(NounText,"ALL")==0)
+				if(xstrcasecmp(NounText,"ALL")==0)
 				{
-					int ct=0;
+					int i=0;
 					int f=0;
-					while(ct<=GameHeader.NumItems)
+					while(i<=GameHeader.NumItems)
 					{
-						if(Items[ct].Location==CARRIED && Items[ct].AutoGet && Items[ct].AutoGet[0]!='*')
+						if(Items[i].Location==CARRIED && Items[i].AutoGet && Items[i].AutoGet[0]!='*')
 						{
-							no=WhichWord(Items[ct].AutoGet,Nouns);
+							no=WhichWord(Items[i].AutoGet,Nouns);
 							disable_sysfunc=1;
 							PerformActions(vb,no);
 							disable_sysfunc=0;
-							Items[ct].Location=MyLoc;
-							OutBuf(Items[ct].Text);
+							Items[i].Location=MyLoc;
+							Output(Items[i].Text);
 							Output(": O.K.\n");
-							Redraw=1;
 							f=1;
 						}
-						ct++;
+						i++;
 					}
 					if(f==0)
 						Output("Nothing dropped.\n");
@@ -1277,8 +1187,8 @@ int PerformActions(int vb,int no)
 					Output("What ? ");
 					return(0);
 				}
-				i=MatchUpItem(NounText,CARRIED);
-				if(i==-1)
+				item=MatchUpItem(NounText,CARRIED);
+				if(item==-1)
 				{
 					if(Options&YOUARE)
 						Output("It's beyond your power to do that.\n");
@@ -1286,21 +1196,39 @@ int PerformActions(int vb,int no)
 						Output("It's beyond my power to do that.\n");
 					return(0);
 				}
-				Items[i].Location=MyLoc;
+				Items[item].Location=MyLoc;
 				Output("O.K. ");
-				Redraw=1;
 				return(0);
 			}
 		}
 	}
 	return(fl);
 }
-	
-void main(int argc, char *argv[])
+
+glkunix_argumentlist_t glkunix_arguments[] =
 {
-	FILE *f;
-	int vb,no;
-	
+	{ "-y",		glkunix_arg_NoValue,		"-y		Generate 'You are', 'You are carrying' type messages for games that use these instead (eg Robin Of Sherwood)" },
+	{ "-i",		glkunix_arg_NoValue,		"-i		Generate 'I am' type messages (default)" },
+	{ "-d",		glkunix_arg_NoValue,		"-d		Debugging info on load " },
+	{ "-s",		glkunix_arg_NoValue,		"-s		Generate authentic Scott Adams driver light messages rather than other driver style ones (Light goes out in n turns..)" },
+	{ "-t",		glkunix_arg_NoValue,		"-t		Generate TRS80 style display (terminal width is 64 characters; a line <-----------------> is displayed after the top stuff; objects have periods after them instead of hyphens" },
+	{ "-p",		glkunix_arg_NoValue,		"-p		Use for prehistoric databases which don't use bit 16" },
+	{ "-w",		glkunix_arg_NoValue,		"-w		Disable upper window" },
+	{ "",		glkunix_arg_ValueFollows,	"filename	file to load" },
+
+	{ NULL, glkunix_arg_End, NULL }
+};
+
+static const char *game_file;
+
+int glkunix_startup_code(glkunix_startup_t *data)
+{
+	int argc = data->argc;
+	char **argv = data->argv;
+
+	if(argc < 1)
+		return 0;
+
 	while(argv[1])
 	{
 		if(*argv[1]!='-')
@@ -1325,86 +1253,99 @@ void main(int argc, char *argv[])
 			case 'p':
 				Options|=PREHISTORIC_LAMP;
 				break;
-			case 'h':
-			default:
-				fprintf(stderr,"%s: [-h] [-y] [-s] [-i] [-t] [-d] [-p] <gamename> [savedgame].\n",
-						argv[0]);
-				exit(1);
-		}
-		if(argv[1][2]!=0)
-		{
-			fprintf(stderr,"%s: option -%c does not take a parameter.\n",
-				argv[0],argv[1][1]);
-			exit(1);
+			case 'w':
+				split_screen = 0;
+				break;
 		}
 		argv++;
 		argc--;
-	}			
+	}
 
-	if(argc!=2 && argc!=3)
+#ifdef GARGLK
+	garglk_set_program_name("ScottFree 1.14");
+	garglk_set_program_info(
+		"ScottFree 1.14 by Alan Cox\n"
+		"Glk port by Chris Spiegel\n");
+#endif
+
+	if(argc==2)
 	{
-		fprintf(stderr,"%s <database> <savefile>.\n",argv[0]);
-		exit(1);
+		game_file = argv[1];
+#ifdef GARGLK
+		const char *s;
+		if((s = strrchr(game_file, '/')) != NULL || (s = strrchr(game_file, '\\')) != NULL)
+		{
+			garglk_set_story_name(s + 1);
+		}
+		else
+		{
+			garglk_set_story_name(game_file);
+		}
+#endif
 	}
-	f=fopen(argv[1],"r");
+
+	return 1;
+}
+
+void glk_main(void)
+{
+	FILE *f;
+	int vb,no;
+
+	Bottom = glk_window_open(0, 0, 0, wintype_TextBuffer, 1);
+	if(Bottom == NULL)
+		glk_exit();
+	glk_set_window(Bottom);
+
+	if(game_file == NULL)
+		Fatal("No game provided");
+
+	f = fopen(game_file, "r");
 	if(f==NULL)
-	{
-		perror(argv[1]);
-		exit(1);
-	}
-	signal(SIGINT,Aborted);		/* For BSD curses */
-	signal(SIGQUIT,SIG_IGN);
-	signal(SIGTSTP,SIG_IGN);
-	
+		Fatal("Cannot open game");
+
 	if (Options & TRS80_STYLE)
 	{
 		Width = 64;
 		TopHeight = 11;
-		BottomHeight = 13;
 	}
 	else
 	{
 		Width = 80;
 		TopHeight = 10;
-		BottomHeight = 14;
 	}
 
-	DisplayUp=1;
-	initscr();
-	Top=newwin(TopHeight,Width,0,0);
-	Bottom=newwin(BottomHeight,Width,TopHeight,0);
-	scrollok(Bottom,TRUE);
-	leaveok(Top,TRUE);
-	leaveok(Bottom,FALSE);
-	idlok(Bottom,TRUE);
-	noecho();
-	cbreak();
-	wmove(Bottom,BottomHeight-1,0);
-	OutReset();
-	OutBuf("\
+	if(split_screen)
+	{
+		Top = glk_window_open(Bottom, winmethod_Above | winmethod_Fixed, TopHeight, wintype_TextGrid, 0);
+		if(Top == NULL)
+		{
+			split_screen = 0;
+			Top = Bottom;
+		}
+	}
+	else
+	{
+		Top = Bottom;
+	}
+
+	Output("\
 Scott Free, A Scott Adams game driver in C.\n\
 Release 1.14, (c) 1993,1994,1995 Swansea University Computer Society.\n\
 Distributed under the GNU software license\n\n");
 	LoadDatabase(f,(Options&DEBUGGING)?1:0);
 	fclose(f);
-	if(argc==3)
-		LoadGame(argv[2]);
-	srand(time(NULL)^getpid()^getuid());
-	Look();
+	srand(time(NULL));
 	while(1)
 	{
-		if(Redraw!=0)
-		{
-			Look();
-			Redraw=0;
-		}
+		glk_tick();
+
 		PerformActions(0,0);
-		if(Redraw!=0)
-		{
-			Look();
-			Redraw=0;
-		}
-		GetInput(&vb,&no);
+
+		Look();
+
+		if(GetInput(&vb,&no) == -1)
+			continue;
 		switch(PerformActions(vb,no))
 		{
 			case -1:Output("I don't understand your command. ");
@@ -1435,7 +1376,7 @@ Distributed under the GNU software license\n\n");
 				if(Items[LIGHT_SOURCE].Location==CARRIED ||
 					Items[LIGHT_SOURCE].Location==MyLoc)
 				{
-			
+
 					if(Options&SCOTTLIGHT)
 					{
 						Output("Light runs out in ");

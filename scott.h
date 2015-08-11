@@ -75,5 +75,3 @@ typedef struct
 #define DEBUGGING	4	/* Info from database load */
 #define TRS80_STYLE	8	/* Display in style used on TRS-80 */
 #define PREHISTORIC_LAMP 16	/* Destroy the lamp (very old databases) */
-
-
