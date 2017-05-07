@@ -315,9 +315,13 @@ static void LoadDatabase(FILE *f, int loud)
 		printf("Reading %d rooms.\n",nr);
 	while(ct<nr+1)
 	{
-		fscanf(f,"%hd %hd %hd %hd %hd %hd",
+		if(fscanf(f,"%hd %hd %hd %hd %hd %hd",
 			&rp->Exits[0],&rp->Exits[1],&rp->Exits[2],
-			&rp->Exits[3],&rp->Exits[4],&rp->Exits[5]);
+			&rp->Exits[3],&rp->Exits[4],&rp->Exits[5])!=6)
+		{
+			printf("Bad room line (%d)\n",ct);
+			exit(1);
+		}
 		rp->Text=ReadString(f);
 		ct++;
 		rp++;
@@ -347,7 +351,11 @@ static void LoadDatabase(FILE *f, int loud)
 			if(t!=NULL)
 				*t=0;
 		}
-		fscanf(f,"%hd",&lo);
+		if(fscanf(f,"%hd",&lo)!=1)
+		{
+			printf("Bad item line (%d)\n",ct);
+			exit(1);
+		}
 		ip->Location=(unsigned char)lo;
 		ip->InitialLoc=ip->Location;
 		ip++;
@@ -360,11 +368,19 @@ static void LoadDatabase(FILE *f, int loud)
 		free(ReadString(f));
 		ct++;
 	}
-	fscanf(f,"%d",&ct);
+	if(fscanf(f,"%d",&ct)!=1)
+	{
+		puts("Cannot read version");
+		exit(1);
+	}
 	if(loud)
 		printf("Version %d.%02d of Adventure ",
 		ct/100,ct%100);
-	fscanf(f,"%d",&ct);
+	if(fscanf(f,"%d",&ct)!=1)
+	{
+		puts("Cannot read adventure number");
+		exit(1);
+	}
 	if(loud)
 		printf("%d.\nLoad Complete.\n\n",ct);
 }
