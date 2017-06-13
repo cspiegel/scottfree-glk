@@ -49,7 +49,7 @@
 #ifdef __GNUC__
 __attribute__((__format__(__printf__, 2, 3)))
 #endif
-static void display(winid_t w, const char *fmt, ...)
+static void Display(winid_t w, const char *fmt, ...)
 {
 	va_list ap;
 	char msg[2048];
@@ -67,7 +67,7 @@ static void display(winid_t w, const char *fmt, ...)
 	glk_put_string_stream(glk_window_get_stream(w), msg);
 }
 
-static void delay(int seconds)
+static void Delay(int seconds)
 {
 	event_t ev;
 
@@ -112,7 +112,7 @@ static long BitFlags=0;	/* Might be >32 flags - I haven't seen >32 yet */
 
 static void Fatal(const char *x)
 {
-	display(Bottom, "%s\n", x);
+	Display(Bottom, "%s\n", x);
 	glk_exit();
 }
 
@@ -387,12 +387,12 @@ static void LoadDatabase(FILE *f, int loud)
 
 static void Output(const char *a)
 {
-	display(Bottom, "%s", a);
+	Display(Bottom, "%s", a);
 }
 
 static void OutputNumber(int a)
 {
-	display(Bottom, "%d", a);
+	Display(Bottom, "%d", a);
 }
 
 static void Look(void)
@@ -412,26 +412,26 @@ static void Look(void)
 	            && Items[LIGHT_SOURCE].Location!= MyLoc)
 	{
 		if(Options&YOUARE)
-			display(Top,"You can't see. It is too dark!\n");
+			Display(Top,"You can't see. It is too dark!\n");
 		else
-			display(Top,"I can't see. It is too dark!\n");
+			Display(Top,"I can't see. It is too dark!\n");
 		if (Options & TRS80_STYLE)
-			display(Top,TRS80_LINE);
+			Display(Top,TRS80_LINE);
 		return;
 	}
 	r=&Rooms[MyLoc];
 	if(*r->Text=='*')
-		display(Top,"%s\n",r->Text+1);
+		Display(Top,"%s\n",r->Text+1);
 	else
 	{
 		if(Options&YOUARE)
-			display(Top,"You are in a %s\n",r->Text);
+			Display(Top,"You are in a %s\n",r->Text);
 		else
-			display(Top,"I'm in a %s\n",r->Text);
+			Display(Top,"I'm in a %s\n",r->Text);
 	}
 	ct=0;
 	f=0;
-	display(Top,"\nObvious exits: ");
+	Display(Top,"\nObvious exits: ");
 	while(ct<6)
 	{
 		if(r->Exits[ct]!=0)
@@ -439,14 +439,14 @@ static void Look(void)
 			if(f==0)
 				f=1;
 			else
-				display(Top,", ");
-			display(Top,"%s",ExitNames[ct]);
+				Display(Top,", ");
+			Display(Top,"%s",ExitNames[ct]);
 		}
 		ct++;
 	}
 	if(f==0)
-		display(Top,"none");
-	display(Top,".\n");
+		Display(Top,"none");
+	Display(Top,".\n");
 	ct=0;
 	f=0;
 	pos=0;
@@ -458,39 +458,39 @@ static void Look(void)
 			{
 				if(Options&YOUARE)
 				{
-					display(Top,"\nYou can also see: ");
+					Display(Top,"\nYou can also see: ");
 					pos=18;
 				}
 				else
 				{
-					display(Top,"\nI can also see: ");
+					Display(Top,"\nI can also see: ");
 					pos=16;
 				}
 				f++;
 			}
 			else if (!(Options & TRS80_STYLE))
 			{
-				display(Top," - ");
+				Display(Top," - ");
 				pos+=3;
 			}
 			if(pos+strlen(Items[ct].Text)>(Width-10))
 			{
 				pos=0;
-				display(Top,"\n");
+				Display(Top,"\n");
 			}
-			display(Top,"%s",Items[ct].Text);
+			Display(Top,"%s",Items[ct].Text);
 			pos += strlen(Items[ct].Text);
 			if (Options & TRS80_STYLE)
 			{
-				display(Top,". ");
+				Display(Top,". ");
 				pos+=2;
 			}
 		}
 		ct++;
 	}
-	display(Top,"\n");
+	Display(Top,"\n");
 	if (Options & TRS80_STYLE)
-		display(Top,TRS80_LINE);
+		Display(Top,TRS80_LINE);
 }
 
 static int WhichWord(const char *word, const char **list)
@@ -994,7 +994,7 @@ doneit:				Output("The game is now over.\n");
 				break;
 			}
 			case 88:
-				delay(2);
+				Delay(2);
 				break;
 			case 89:
 				pptr++;
