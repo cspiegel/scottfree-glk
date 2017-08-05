@@ -131,11 +131,8 @@ static void *MemAlloc(int size)
 
 static int RandomPercent(int n)
 {
-	unsigned int rv=rand()<<6;
-	rv%=100;
-	if(rv<n)
-		return(1);
-	return(0);
+	int rv = rand() / (RAND_MAX / 100 + 1);
+	return(rv<n);
 }
 
 static int CountCarried(void)
